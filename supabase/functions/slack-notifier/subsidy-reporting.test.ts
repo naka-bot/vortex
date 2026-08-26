@@ -3,6 +3,8 @@ import {
   buildCompletionAttributionFields,
   buildQuoteAttributionFields,
   chunkFields,
+  hasQuoteAttribution,
+  notificationKind,
   type SubsidyQuote
 } from "./subsidy-reporting";
 
@@ -59,6 +61,28 @@ const blockQuote: SubsidyQuote = {
   output_currency: "USDT"
 };
 
+const alfredpayQuote: SubsidyQuote = {
+  input_amount: "100",
+  metadata: {
+    blocks: {
+      alfredpayOfframp: {
+        adjustedDifference: "0",
+        adjustedTargetDiscount: "0.001",
+        pricing: {
+          customer: { allInRate: "17.017", inputAmountUsd: "100", referenceDifferenceBps: "10" },
+          provider: { baseCurrency: "USDT", netReferenceDifferenceBps: "25" },
+          reference: { rate: "17", source: "fastforex" }
+        },
+        subsidyAmountDecimal: "5.75"
+      },
+      distributeFees: { vortexFeeUsd: "0.35" }
+    },
+    globals: { partner: { targetDiscount: "0.001" } }
+  },
+  output_amount: "1701.70",
+  output_currency: "MXN"
+};
+
 describe("subsidy reporting", () => {
   test("shows quote-time discount, DEX gap, clipping and net subsidy", () => {
     const fields = buildQuoteAttributionFields("BUY", quote);
@@ -84,6 +108,38 @@ describe("subsidy reporting", () => {
     expect(fields.find(field => field.label.includes("Configured"))?.value).toContain("+5.50 bps");
     expect(fields.find(field => field.label.includes("DEX"))?.value).toBe("-20.15 bps");
     expect(fields.find(field => field.label.includes("Quote subsidy"))?.value).toContain("27.653104 USDC");
+  });
+
+  test("reads AlfredPay pricing and settlement subsidy metadata without NaN placeholders", () => {
+    const fields = buildQuoteAttributionFields("SELL", alfredpayQuote);
+    expect(fields.find(field => field.label.includes("Configured"))?.value).toContain("+10.00 bps");
+    expect(fields.find(field => field.label.includes("provider vs reference"))?.value).toBe("+25.00 bps");
+    expect(fields.find(field => field.label.includes("Customer vs reference"))?.value).toBe("+10.00 bps");
+    expect(fields.find(field => field.label.includes("settlement subsidy"))?.value).toBe(
+      "5.750000 USDT (575.00 bps gross)"
+    );
+    expect(fields.find(field => field.label.includes("net subsidy"))?.value).toBe(
+      "+5.400000 USD (+540.00 bps net)"
+    );
+    expect(fields.every(field => !String(field.value).match(/NaN|undefined|_N\/A_/))).toBe(true);
+    expect(hasQuoteAttribution(alfredpayQuote)).toBe(true);
+  });
+
+  test("reports configured negative targets as attribution-worthy", () => {
+    expect(
+      hasQuoteAttribution({
+        ...quote,
+        metadata: { ...quote.metadata, partner: { targetDiscount: "-0.0006" }, subsidy: undefined }
+      })
+    ).toBe(true);
+  });
+
+  test("prioritizes terminal alerts over the initial-to-active alert", () => {
+    expect(notificationKind("initial", "failed")).toBe("failed");
+    expect(notificationKind("initial", "complete")).toBe("complete");
+    expect(notificationKind("initial", "alfredpayOfframpTransfer")).toBe("started");
+    expect(notificationKind("initial", "timedOut")).toBeUndefined();
+    expect(notificationKind("complete", "complete")).toBeUndefined();
   });
 
   test("chunks Slack fields at the platform limit", () => {

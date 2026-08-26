@@ -5,14 +5,11 @@ import {
   buildCompletionAttributionFields,
   buildQuoteAttributionFields,
   chunkFields,
-  feeMetadata,
-  partnerMetadata,
+  hasQuoteAttribution,
+  notificationKind,
   type SlackField,
   type SubsidyQuote,
-  type SubsidyRow,
-  subsidyMetadata,
-  swapMetadata,
-  vortexFeeUsd
+  type SubsidyRow
 } from "./subsidy-reporting.ts";
 
 function trimToSixDecimals(floatStr: string | number) {
@@ -26,11 +23,7 @@ function trimToSixDecimals(floatStr: string | number) {
 const techiesGroupId = "S03GPNXTM7A";
 
 const fieldIcons = {
-  fee: "💰",
-  output: "🎯",
-  rate: "📈",
   session: "🧾",
-  subsidy: "💸",
   tax: "🏛️",
   wallet: "👛"
 };
@@ -49,6 +42,7 @@ type RampRecord = {
   };
   to: string;
   type: string;
+  user_id?: string;
 };
 
 type Quote = SubsidyQuote & {
@@ -70,27 +64,22 @@ function formatSlackMessage(
   const outputAmount = quote.output_amount;
   const outputCurrency = quote.output_currency;
 
-  const subsidy = subsidyMetadata(quote);
-  const partner = partnerMetadata(quote);
-  const swap = swapMetadata(quote);
-  const fees = feeMetadata(quote);
-  const { expectedOutputAmountDecimal, subsidyAmountInOutputTokenDecimal, adjustedDifference } = subsidy || {};
-  const { targetDiscount } = partner || {};
-  const { oraclePrice } = swap || {};
-  const quoteSubsidyCurrency = subsidy.outputCurrency || swap?.outputCurrency || outputCurrency;
-
   const finalWalletAddress = walletAddress || destinationAddress;
 
-  const fields: SlackField[] = [
-    {
+  const fields: SlackField[] = [];
+  if (finalWalletAddress) {
+    fields.push({
       label: `${fieldIcons.wallet} Wallet Address`,
       value: finalWalletAddress
-    },
-    {
+    });
+  }
+  const finalUserId = record.user_id || userId || sessionId;
+  if (finalUserId) {
+    fields.push({
       label: `${fieldIcons.session} User ID`,
-      value: userId || sessionId
-    }
-  ];
+      value: finalUserId
+    });
+  }
 
   if (taxId) {
     fields.push({
@@ -99,33 +88,7 @@ function formatSlackMessage(
     });
   }
 
-  if (Number(targetDiscount) > 0) {
-    const oraclePriceForDirection = rampType === "BUY" ? Number(oraclePrice) : 1 / Number(oraclePrice);
-
-    const discountedRate = oraclePriceForDirection * (1 + Number(targetDiscount));
-    const effectiveRate = Number(outputAmount) / Number(inputAmount);
-    const effectiveRateComparison = trimToSixDecimals(effectiveRate / oraclePriceForDirection);
-
-    fields.push({
-      label: `${fieldIcons.rate} Discounted Rate (oracle × ${1 + Number(targetDiscount)}; dynamic ${Number(adjustedDifference)})`,
-      value: discountedRate
-    });
-    fields.push({
-      label: `${fieldIcons.output} Ideal Output for Discount`,
-      value: `${trimToSixDecimals(expectedOutputAmountDecimal)} ${quoteSubsidyCurrency}`
-    });
-    fields.push({
-      label: `${fieldIcons.rate} Effective Rate (Binance x ${effectiveRateComparison})`,
-      value: effectiveRate
-    });
-    fields.push({
-      label: `${fieldIcons.subsidy} Subsidy Amount`,
-      value: `${trimToSixDecimals(subsidyAmountInOutputTokenDecimal)} ${quoteSubsidyCurrency}`
-    });
-    fields.push({
-      label: `${fieldIcons.fee} Fee Revenue (Vortex)`,
-      value: `${trimToSixDecimals(vortexFeeUsd(quote) ?? "")} USD | ${fees?.displayFiat?.vortex ?? ""} ${fees?.displayFiat?.currency ?? ""}`
-    });
+  if (hasQuoteAttribution(quote)) {
     fields.push(...buildQuoteAttributionFields(rampType, quote));
   }
 
@@ -181,19 +144,18 @@ Deno.serve(async req => {
     const quoteId = record.quote_id;
     const { data: quote, error } = await supabaseClient.from("quote_tickets").select("*").eq("id", quoteId).single();
     if (error) {
-      console.error("Couldn't find quote in table:", error);
+      throw new Error(`Couldn't find quote in table: ${error.message}`);
     }
     if (type === "UPDATE") {
-      if (oldRecord.current_phase === "initial" && record.current_phase !== "initial" && record.current_phase !== "timedOut") {
-        slackPayload = formatSlackMessage(record, quote as Quote, `▶️ *Ramp \`${record.id}\` started*`, true);
-      } else if (oldRecord.current_phase !== "failed" && record.current_phase === "failed") {
+      const notification = notificationKind(oldRecord.current_phase, record.current_phase);
+      if (notification === "failed") {
         slackPayload = formatSlackMessage(
           record,
           quote as Quote,
           `🚨 <!subteam^${techiesGroupId}>: *Ramp \`${record.id}\` got stuck in state \`${oldRecord.current_phase}\`*`,
           true
         );
-      } else if (oldRecord.current_phase !== "complete" && record.current_phase === "complete") {
+      } else if (notification === "complete") {
         const { data: subsidyRows, error: subsidyError } = await supabaseClient
           .from("subsidies")
           .select("amount,phase,token")
@@ -211,21 +173,29 @@ Deno.serve(async req => {
           true,
           completionFields
         );
+      } else if (notification === "started") {
+        slackPayload = formatSlackMessage(record, quote as Quote, `▶️ *Ramp \`${record.id}\` started*`, true);
       }
     }
 
-    const slackWebhookUrl = Deno.env.get("SLACK_WEBHOOK_URL");
     if (!slackPayload) {
       return new Response(null, { status: 204 });
     }
+    const slackWebhookUrl = Deno.env.get("SLACK_WEBHOOK_URL");
+    if (!slackWebhookUrl) {
+      throw new Error("SLACK_WEBHOOK_URL is not configured");
+    }
     console.log("Sending Message to Slack");
-    await fetch(slackWebhookUrl, {
+    const slackResponse = await fetch(slackWebhookUrl, {
       body: JSON.stringify(slackPayload),
       headers: {
         "Content-Type": "application/json"
       },
       method: "POST"
     });
+    if (!slackResponse.ok) {
+      throw new Error(`Slack webhook failed with HTTP ${slackResponse.status}`);
+    }
     return new Response(
       JSON.stringify({
         message: "Success"

@@ -5,6 +5,8 @@ export type SlackField = {
 
 export type RampDirection = "BUY" | "SELL" | string;
 
+export type NotificationKind = "complete" | "failed" | "started";
+
 export type SubsidyRow = {
   amount: number | string;
   phase: string;
@@ -15,6 +17,7 @@ export type SubsidyQuote = {
   input_amount: number | string;
   metadata: {
     blocks?: {
+      alfredpayOfframp?: AlfredpayOfframpMetadata;
       distributeFees?: {
         vortexFeeUsd?: number | string;
       };
@@ -75,6 +78,27 @@ type SwapMetadata = {
   outputCurrency?: string;
 };
 
+type AlfredpayOfframpMetadata = {
+  adjustedDifference?: number | string;
+  adjustedTargetDiscount?: number | string;
+  pricing?: {
+    customer?: {
+      allInRate?: number | string;
+      inputAmountUsd?: number | string;
+      referenceDifferenceBps?: number | string;
+    };
+    provider?: {
+      baseCurrency?: string;
+      netReferenceDifferenceBps?: number | string;
+    };
+    reference?: {
+      rate?: number | string;
+      source?: string;
+    };
+  };
+  subsidyAmountDecimal?: number | string;
+};
+
 const EPSILON = 1e-9;
 
 function finiteNumber(value: unknown): number | undefined {
@@ -115,6 +139,10 @@ function quoteSubsidyCurrency(quote: SubsidyQuote): string {
   return subsidyMetadata(quote).outputCurrency || swapMetadata(quote)?.outputCurrency || quote.output_currency;
 }
 
+function alfredpayMetadata(quote: SubsidyQuote): AlfredpayOfframpMetadata | undefined {
+  return quote.metadata.blocks?.alfredpayOfframp;
+}
+
 export function vortexFeeUsd(quote: SubsidyQuote): number | undefined {
   return finiteNumber(
     feeMetadata(quote).usd?.vortex ?? quote.metadata.blocks?.distributeFees?.vortexFeeUsd ?? quote.metadata.fees?.usd?.vortex
@@ -125,9 +153,50 @@ export function buildQuoteAttributionFields(rampType: RampDirection, quote: Subs
   const partner = partnerMetadata(quote);
   const subsidy = subsidyMetadata(quote);
   const swap = swapMetadata(quote);
+  const alfredpay = alfredpayMetadata(quote);
   const targetDiscount = finiteNumber(partner.targetDiscount) ?? 0;
-  const dynamicAdjustment = finiteNumber(subsidy.adjustedDifference) ?? 0;
-  const adjustedDiscount = finiteNumber(subsidy.adjustedTargetDiscount) ?? targetDiscount + dynamicAdjustment;
+  const dynamicAdjustment = finiteNumber(alfredpay?.adjustedDifference ?? subsidy.adjustedDifference) ?? 0;
+  const adjustedDiscount =
+    finiteNumber(alfredpay?.adjustedTargetDiscount ?? subsidy.adjustedTargetDiscount) ?? targetDiscount + dynamicAdjustment;
+  if (alfredpay) {
+    const inputAmountUsd = finiteNumber(alfredpay.pricing?.customer?.inputAmountUsd);
+    const providerDifferenceBps = finiteNumber(alfredpay.pricing?.provider?.netReferenceDifferenceBps);
+    const customerDifferenceBps = finiteNumber(alfredpay.pricing?.customer?.referenceDifferenceBps);
+    const quotedSubsidyUsd = finiteNumber(alfredpay.subsidyAmountDecimal) ?? 0;
+    const quotedSubsidyBps = bps(quotedSubsidyUsd, inputAmountUsd);
+    const feeUsd = vortexFeeUsd(quote);
+    const netSubsidyUsd = quotedSubsidyUsd - (feeUsd ?? 0);
+    const netSubsidyBps = bps(netSubsidyUsd, inputAmountUsd);
+    const subsidyCurrency = alfredpay.pricing?.provider?.baseCurrency || "USD";
+
+    const fields: SlackField[] = [
+      {
+        label: "🎯 Configured discount",
+        value: `${signed(targetDiscount * 10_000)} bps + dynamic ${signed(dynamicAdjustment * 10_000)} bps = ${signed(adjustedDiscount * 10_000)} bps`
+      },
+      {
+        label: "📉 AlfredPay provider vs reference (quote time)",
+        value: providerDifferenceBps === undefined ? "_Not available_" : `${signed(providerDifferenceBps)} bps`
+      },
+      {
+        label: "📊 Customer vs reference (quote time)",
+        value: customerDifferenceBps === undefined ? "_Not available_" : `${signed(customerDifferenceBps)} bps`
+      },
+      {
+        label: "💸 AlfredPay settlement subsidy (quoted)",
+        value: `${amount(quotedSubsidyUsd)} ${subsidyCurrency}${quotedSubsidyBps === undefined ? "" : ` (${quotedSubsidyBps.toFixed(2)} bps gross)`}`
+      }
+    ];
+
+    if (feeUsd !== undefined) {
+      fields.push({
+        label: "🧮 Quote net subsidy after Vortex fee",
+        value: `${signed(netSubsidyUsd, 6)} USD${netSubsidyBps === undefined ? "" : ` (${signed(netSubsidyBps)} bps net)`}`
+      });
+    }
+    return fields;
+  }
+
   const expectedOutput = finiteNumber(subsidy.expectedOutputAmountDecimal);
   const idealSubsidy = finiteNumber(subsidy.idealSubsidyAmountInOutputTokenDecimal) ?? 0;
   const quoteSubsidy = finiteNumber(subsidy.subsidyAmountInOutputTokenDecimal) ?? 0;
@@ -178,6 +247,20 @@ export function buildQuoteAttributionFields(rampType: RampDirection, quote: Subs
   }
 
   return fields;
+}
+
+export function hasQuoteAttribution(quote: SubsidyQuote): boolean {
+  const targetDiscount = finiteNumber(partnerMetadata(quote).targetDiscount) ?? 0;
+  const quoteSubsidy = finiteNumber(subsidyMetadata(quote).subsidyAmountInOutputTokenDecimal) ?? 0;
+  const alfredpaySubsidy = finiteNumber(alfredpayMetadata(quote)?.subsidyAmountDecimal) ?? 0;
+  return targetDiscount !== 0 || quoteSubsidy !== 0 || alfredpaySubsidy !== 0;
+}
+
+export function notificationKind(oldPhase: string | undefined, newPhase: string | undefined): NotificationKind | undefined {
+  if (newPhase === "failed" && oldPhase !== "failed") return "failed";
+  if (newPhase === "complete" && oldPhase !== "complete") return "complete";
+  if (oldPhase === "initial" && newPhase !== "initial" && newPhase !== "timedOut") return "started";
+  return undefined;
 }
 
 function sumPhase(rows: SubsidyRow[], phase: string, token?: string): number {
