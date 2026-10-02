@@ -139,6 +139,10 @@ function quoteSubsidyCurrency(quote: SubsidyQuote): string {
   return subsidyMetadata(quote).outputCurrency || swapMetadata(quote)?.outputCurrency || quote.output_currency;
 }
 
+function isUsdCurrency(currency: string | undefined): boolean {
+  return !!currency && ["USD", "USDC", "USDC.AXL", "USDT"].includes(currency.toUpperCase());
+}
+
 function alfredpayMetadata(quote: SubsidyQuote): AlfredpayOfframpMetadata | undefined {
   return quote.metadata.blocks?.alfredpayOfframp;
 }
@@ -147,6 +151,16 @@ export function vortexFeeUsd(quote: SubsidyQuote): number | undefined {
   return finiteNumber(
     feeMetadata(quote).usd?.vortex ?? quote.metadata.blocks?.distributeFees?.vortexFeeUsd ?? quote.metadata.fees?.usd?.vortex
   );
+}
+
+function quoteAmountUsd(quote: SubsidyQuote, value: number, currency: string): number | undefined {
+  if (isUsdCurrency(currency)) return value;
+  const swap = swapMetadata(quote);
+  const oraclePrice = finiteNumber(swap?.oraclePrice);
+  if (swap?.outputCurrency?.toUpperCase() !== currency.toUpperCase() || !oraclePrice || oraclePrice <= 0) {
+    return undefined;
+  }
+  return value * oraclePrice;
 }
 
 export function buildQuoteAttributionFields(rampType: RampDirection, quote: SubsidyQuote): SlackField[] {
@@ -215,10 +229,11 @@ export function buildQuoteAttributionFields(rampType: RampDirection, quote: Subs
   const clipped = Math.max(0, idealSubsidy - quoteSubsidy);
   const clippedBps = bps(clipped, expectedOutput);
   const quoteSubsidyBps = bps(quoteSubsidy, expectedOutput);
+  const quoteSubsidyUsd = quoteAmountUsd(quote, quoteSubsidy, currency);
+  const expectedOutputUsd = expectedOutput === undefined ? undefined : quoteAmountUsd(quote, expectedOutput, currency);
   const feeUsd = vortexFeeUsd(quote);
-  const quoteNetUsd =
-    quoteSubsidyCurrency(quote) === "USDC" || quoteSubsidyCurrency(quote) === "USDT" ? quoteSubsidy - (feeUsd ?? 0) : undefined;
-  const quoteNetBps = quoteNetUsd === undefined ? undefined : bps(quoteNetUsd, expectedOutput);
+  const quoteNetUsd = quoteSubsidyUsd === undefined || feeUsd === undefined ? undefined : quoteSubsidyUsd - feeUsd;
+  const quoteNetBps = quoteNetUsd === undefined ? undefined : bps(quoteNetUsd, expectedOutputUsd);
 
   const fields: SlackField[] = [
     {
@@ -286,16 +301,28 @@ export function buildCompletionAttributionFields(quote: SubsidyQuote, rows: Subs
   const postSwapPaid = sumPhase(rows, "subsidizePostSwap", currency);
   const executionDifference = postSwapPaid - quoteSubsidy;
   const executionBps = bps(executionDifference, expectedOutput);
-  return [
+  const executedSubsidyUsd = quoteAmountUsd(quote, postSwapPaid, currency);
+  const expectedOutputUsd = expectedOutput === undefined ? undefined : quoteAmountUsd(quote, expectedOutput, currency);
+  const feeUsd = vortexFeeUsd(quote);
+  const executedNetUsd = executedSubsidyUsd === undefined || feeUsd === undefined ? undefined : executedSubsidyUsd - feeUsd;
+  const executedNetBps = executedNetUsd === undefined ? undefined : bps(executedNetUsd, expectedOutputUsd);
+  const fields: SlackField[] = [
     {
       label: "📊 Quote → execution discrepancy",
       value: `${signed(executionDifference, 6)} ${currency}${executionBps === undefined ? "" : ` (${signed(executionBps)} bps)`}`
-    },
-    {
-      label: "🏁 Final-settlement subsidy",
-      value: formatPhaseRows(rows, "finalSettlementSubsidy")
     }
   ];
+  if (executedNetUsd !== undefined) {
+    fields.push({
+      label: "🧮 Executed net subsidy after Vortex fee",
+      value: `${signed(executedNetUsd, 6)} USD${executedNetBps === undefined ? "" : ` (${signed(executedNetBps)} bps net)`}`
+    });
+  }
+  fields.push({
+    label: "🏁 Final-settlement subsidy",
+    value: formatPhaseRows(rows, "finalSettlementSubsidy")
+  });
+  return fields;
 }
 
 export function chunkFields(fields: SlackField[], size = 10): SlackField[][] {

@@ -83,6 +83,36 @@ const alfredpayQuote: SubsidyQuote = {
   output_currency: "MXN"
 };
 
+const brlOfframpQuote: SubsidyQuote = {
+  input_amount: "2095.78",
+  metadata: {
+    blocks: {
+      distributeFees: { vortexFeeUsd: "7.33451910" },
+      nablaSwap: {
+        inputAmountForSwapDecimal: "2087.139956",
+        oraclePrice: "0.19125212767992043911",
+        outputAmountDecimal: "10917.953352069436463806",
+        outputCurrency: "BRLA"
+      },
+      subsidizePostSwap: {
+        expectedOutputAmountDecimal: "10972.6526421075",
+        idealSubsidyAmountInOutputTokenDecimal: "54.69929",
+        outputCurrency: "BRLA",
+        subsidyAmountInOutputTokenDecimal: "54.69929"
+      }
+    },
+    globals: {
+      fees: {
+        displayFiat: { currency: "BRL", vortex: "38.35" },
+        usd: { vortex: "7.33451910" }
+      },
+      partner: { targetDiscount: "0.0014" }
+    }
+  },
+  output_amount: "10971.9",
+  output_currency: "BRL"
+};
+
 describe("subsidy reporting", () => {
   test("shows quote-time discount, DEX gap, clipping and net subsidy", () => {
     const fields = buildQuoteAttributionFields("BUY", quote);
@@ -99,8 +129,11 @@ describe("subsidy reporting", () => {
       { amount: "9.5", phase: "subsidizePostSwap", token: "USDC" },
       { amount: "0.12", phase: "finalSettlementSubsidy", token: "USDT" }
     ]);
-    expect(fields[0].value).toContain("-0.500000 USDC");
-    expect(fields[1].value).toBe("0.120000 USDT");
+    expect(fields.find(field => field.label.includes("discrepancy"))?.value).toContain("-0.500000 USDC");
+    expect(fields.find(field => field.label.includes("Executed net"))?.value).toBe(
+      "+6.000000 USD (+299.84 bps net)"
+    );
+    expect(fields.find(field => field.label.includes("Final-settlement"))?.value).toBe("0.120000 USDT");
   });
 
   test("reads current block-based quote metadata and prefers precise swap amounts", () => {
@@ -108,6 +141,22 @@ describe("subsidy reporting", () => {
     expect(fields.find(field => field.label.includes("Configured"))?.value).toContain("+5.50 bps");
     expect(fields.find(field => field.label.includes("DEX"))?.value).toBe("-20.15 bps");
     expect(fields.find(field => field.label.includes("Quote subsidy"))?.value).toContain("27.653104 USDC");
+  });
+
+  test("reports BRL offramp net subsidy in USD using the quote-time oracle price", () => {
+    const fields = buildQuoteAttributionFields("SELL", brlOfframpQuote);
+    expect(fields.find(field => field.label.includes("Quote subsidy"))?.value).toBe(
+      "54.699290 BRLA (49.85 bps gross)"
+    );
+    expect(fields.find(field => field.label.includes("net subsidy"))?.value).toBe(
+      "+3.126836 USD (+14.90 bps net)"
+    );
+    const completionFields = buildCompletionAttributionFields(brlOfframpQuote, [
+      { amount: "55.1164582088559", phase: "subsidizePostSwap", token: "BRLA" }
+    ]);
+    expect(completionFields.find(field => field.label.includes("Executed net"))?.value).toBe(
+      "+3.206621 USD (+15.28 bps net)"
+    );
   });
 
   test("reads AlfredPay pricing and settlement subsidy metadata without NaN placeholders", () => {
