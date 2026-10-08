@@ -136,6 +136,18 @@ describe("subsidy reporting", () => {
     expect(fields.find(field => field.label.includes("Final-settlement"))?.value).toBe("0.120000 USDT");
   });
 
+  test("distinguishes an unused final-settlement phase from a recorded zero subsidy", () => {
+    const unusedFields = buildCompletionAttributionFields(quote, []);
+    expect(unusedFields.find(field => field.label.includes("Final-settlement"))?.value).toBe(
+      "_Not applicable — phase not used_"
+    );
+
+    const zeroFields = buildCompletionAttributionFields(quote, [
+      { amount: "0", phase: "finalSettlementSubsidy", token: "USDT" }
+    ]);
+    expect(zeroFields.find(field => field.label.includes("Final-settlement"))?.value).toBe("0.000000 USDT");
+  });
+
   test("reads current block-based quote metadata and prefers precise swap amounts", () => {
     const fields = buildQuoteAttributionFields("BUY", blockQuote);
     expect(fields.find(field => field.label.includes("Configured"))?.value).toContain("+5.50 bps");

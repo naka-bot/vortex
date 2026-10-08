@@ -289,7 +289,7 @@ function formatPhaseRows(rows: SubsidyRow[], phase: string): string {
   for (const row of rows.filter(row => row.phase.toLowerCase() === phase.toLowerCase())) {
     totals.set(row.token, (totals.get(row.token) ?? 0) + (finiteNumber(row.amount) ?? 0));
   }
-  if (totals.size === 0) return "0";
+  if (totals.size === 0) return "_Not applicable — phase not used_";
   return [...totals.entries()].map(([token, value]) => `${amount(value)} ${token}`).join(" + ");
 }
 
